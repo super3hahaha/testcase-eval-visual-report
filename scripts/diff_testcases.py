@@ -17,7 +17,69 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-RED_COLOR = "#ea4335"
+# ── 颜色处理 ──────────────────────────────────────────────
+
+
+def _parse_color(c):
+    """解析颜色字符串为 (r, g, b)，失败返回 None。支持 #rgb / #rrggbb / rgb(...)。"""
+    if not c:
+        return None
+    c = c.strip().lower()
+    m = re.match(r"#([0-9a-f]{6})$", c)
+    if m:
+        x = int(m.group(1), 16)
+        return ((x >> 16) & 0xff, (x >> 8) & 0xff, x & 0xff)
+    m = re.match(r"#([0-9a-f]{3})$", c)
+    if m:
+        h = m.group(1)
+        return (int(h[0] * 2, 16), int(h[1] * 2, 16), int(h[2] * 2, 16))
+    m = re.match(r"rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)", c)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return None
+
+
+def _is_default_color(rgb):
+    """判断颜色是否为"默认文本色"（黑/深灰/白/中性灰），即非高亮。"""
+    r, g, b = rgb
+    if max(r, g, b) < 80:          # 接近黑
+        return True
+    if min(r, g, b) > 230:         # 接近白
+        return True
+    if max(r, g, b) - min(r, g, b) < 25:  # 灰色（RGB 三通道接近）
+        return True
+    return False
+
+
+def _dominant_channel(rgb):
+    """返回主导 RGB 通道：'R' / 'G' / 'B'。"""
+    r, g, b = rgb
+    if r >= g and r >= b:
+        return "R"
+    if g >= r and g >= b:
+        return "G"
+    return "B"
+
+
+class ColorMatcher:
+    """判定一个颜色字符串是否属于"同色系"（主导通道相同）。"""
+
+    def __init__(self, target_hex):
+        self.target = (target_hex or "").strip().lower()
+        rgb = _parse_color(self.target)
+        self.target_rgb = rgb
+        self.dominant = _dominant_channel(rgb) if rgb else None
+
+    def __call__(self, color):
+        if not color:
+            return False
+        c = color.strip().lower()
+        if self.target and c == self.target:
+            return True
+        rgb = _parse_color(c)
+        if rgb is None or _is_default_color(rgb):
+            return False
+        return self.dominant is not None and _dominant_channel(rgb) == self.dominant
 
 
 # ── HTML 解析 ──────────────────────────────────────────────
@@ -37,25 +99,56 @@ def parse_css_color_map(soup):
     return cmap
 
 
-def _is_red(element, cmap):
-    """判断一个 Tag 元素的文字颜色是否为红色。"""
-    if not isinstance(element, Tag):
-        return False
-    style = element.get("style", "")
+def _element_color(el, cmap):
+    """取元素的有效文字颜色：inline style 优先于 class。"""
+    if not isinstance(el, Tag):
+        return None
+    style = el.get("style", "")
     if style:
         m = re.search(r'(?<![-\w])color\s*:\s*([^;"\s]+)', style)
-        if m and m.group(1).strip().lower() == RED_COLOR:
-            return True
-    for c in element.get("class", []):
-        if cmap.get(c, "") == RED_COLOR:
-            return True
-    return False
+        if m:
+            return m.group(1).strip().lower()
+    for c in el.get("class", []):
+        if c in cmap:
+            return cmap[c]
+    return None
 
 
-def _extract_segments(el, cmap, parent_red=False):
-    """递归提取元素内的 (text, is_red) 片段列表。"""
+def detect_highlight_color(soup, cmap):
+    """探测表格主体内最常见的"非默认"文本色，按字符数加权。无则返回 None。"""
+    table = soup.find("table", class_="waffle")
+    if not table:
+        return None
+    tbody = table.find("tbody") or table
+    rows = tbody.find_all("tr")[1:]  # 跳过表头
+
+    counts = {}
+    for row in rows:
+        for td in row.find_all("td"):
+            # 取 td 自身的颜色作为代表（嵌套 span 通常不覆盖）
+            color = _element_color(td, cmap)
+            if not color:
+                continue
+            rgb = _parse_color(color)
+            if rgb is None or _is_default_color(rgb):
+                continue
+            counts[color] = counts.get(color, 0) + len(td.get_text(strip=True))
+
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda x: x[1])[0]
+
+
+def _is_highlight(element, cmap, matcher):
+    """判断元素的文字颜色是否被 matcher 视为高亮色。"""
+    color = _element_color(element, cmap)
+    return matcher(color) if color else False
+
+
+def _extract_segments(el, cmap, matcher, parent_red=False):
+    """递归提取元素内的 (text, is_red) 片段列表。is_red 实际含义为"高亮色"。"""
     segs = []
-    red = parent_red or _is_red(el, cmap)
+    red = parent_red or _is_highlight(el, cmap, matcher)
     for ch in el.children:
         if isinstance(ch, NavigableString):
             t = str(ch)
@@ -65,7 +158,7 @@ def _extract_segments(el, cmap, parent_red=False):
             if ch.name == "br":
                 segs.append(("\n", red))
             else:
-                segs.extend(_extract_segments(ch, cmap, red))
+                segs.extend(_extract_segments(ch, cmap, matcher, red))
     return segs
 
 
@@ -78,14 +171,33 @@ def _make_cell(segments):
     }
 
 
-def parse_html_table(filepath):
-    """解析 HTML 文件，返回结构化的行列表。"""
+def parse_html_table(filepath, match_target=None, role="文件"):
+    """解析 HTML 文件，返回 (rows, detected_color, match_target_used)。
+
+    match_target:
+      - None → 用本文件自动探测出的高亮色作为匹配目标（AI 文件场景）。
+      - 指定值 → 用 ColorMatcher 做"同色系"匹配（人工文件场景，传入 AI 探测出的色）。
+    detected_color: 本文件中实际探测到的高亮色（用于日志展示，与 match_target 可能不同）。
+    role: 出错信息中标识文件角色（"AI" / "人工" 等）。
+    """
     soup = BeautifulSoup(Path(filepath).read_text(encoding="utf-8"), "html.parser")
     cmap = parse_css_color_map(soup)
 
     table = soup.find("table", class_="waffle")
     if not table:
         sys.exit(f"Error: 在 {filepath} 中未找到 <table class='waffle'>")
+
+    detected = detect_highlight_color(soup, cmap)
+
+    if match_target is None:
+        if detected is None:
+            sys.exit(
+                f"Error: 无法从{role}文件 {filepath} 自动探测高亮色。\n"
+                f"请确认表格内容已用非黑色文本标记，或通过 CLI 参数手动指定颜色。"
+            )
+        match_target = detected
+
+    matcher = ColorMatcher(match_target)
 
     tbody = table.find("tbody") or table
     rows = tbody.find_all("tr")[1:]  # 跳过列标题行
@@ -107,7 +219,7 @@ def parse_html_table(filepath):
             elif ti < len(tds):
                 td = tds[ti]
                 ti += 1
-                cell = _make_cell(_extract_segments(td, cmap))
+                cell = _make_cell(_extract_segments(td, cmap, matcher))
                 rs = int(td.get("rowspan", 1))
                 if rs > 1:
                     spans[col] = (rs - 1, cell)
@@ -130,7 +242,7 @@ def parse_html_table(filepath):
             }
         )
 
-    return parsed
+    return parsed, detected, match_target
 
 
 # ── Diff 计算 ──────────────────────────────────────────────
@@ -142,6 +254,83 @@ def _diff(a, b):
     d = sum(i2 - i1 for op, i1, i2, _, _ in ops if op in ("delete", "replace"))
     a_ = sum(j2 - j1 for op, _, _, j1, j2 in ops if op in ("insert", "replace"))
     return d, a_, ops
+
+
+# ── 行匹配 ────────────────────────────────────────────────
+
+
+# 模糊匹配阈值：名称+描述+预期 加权相似度 >= 该值才视为同一行
+FUZZY_MATCH_THRESHOLD = 0.5
+
+
+def _row_similarity(a_row, b_row):
+    """计算两行的内容相似度，加权综合 用例名/描述/预期 三列。
+
+    模块列不参与匹配（人工常给模块改名/加前缀），其它三列内容才是行的真正"身份"。
+    """
+    def ratio(a, b):
+        if not a and not b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+    name = ratio(a_row["cells"][1]["full_text"], b_row["cells"][1]["full_text"])
+    desc = ratio(a_row["cells"][2]["full_text"], b_row["cells"][2]["full_text"])
+    expt = ratio(a_row["cells"][3]["full_text"], b_row["cells"][3]["full_text"])
+    return name * 0.3 + desc * 0.4 + expt * 0.3
+
+
+def _match_rows(ai_rows, hu_rows):
+    """两阶段匹配：先 (模块, 用例名) 精确匹配，剩余用内容相似度贪心匹配。
+
+    返回 pairs: list of (ai_idx | None, hu_idx | None)，按 AI 行顺序，
+    末尾追加未匹配上的人工新增行。
+    """
+    n_ai, n_hu = len(ai_rows), len(hu_rows)
+    ai_to_hu = [None] * n_ai
+    hu_used = [False] * n_hu
+
+    # Pass 1: 精确 key 匹配
+    hu_by_key = {}
+    for j, r in enumerate(hu_rows):
+        hu_by_key.setdefault(r["key"], []).append(j)
+    for i, ai in enumerate(ai_rows):
+        bucket = hu_by_key.get(ai["key"], [])
+        while bucket:
+            j = bucket.pop(0)
+            if not hu_used[j]:
+                ai_to_hu[i] = j
+                hu_used[j] = True
+                break
+
+    # Pass 2: 剩余行模糊匹配 — 计算所有候选对的相似度，按分数降序贪心
+    unmatched_ai = [i for i in range(n_ai) if ai_to_hu[i] is None]
+    unmatched_hu = [j for j in range(n_hu) if not hu_used[j]]
+
+    candidates = []
+    for i in unmatched_ai:
+        for j in unmatched_hu:
+            s = _row_similarity(ai_rows[i], hu_rows[j])
+            if s >= FUZZY_MATCH_THRESHOLD:
+                candidates.append((s, i, j))
+    candidates.sort(reverse=True)
+
+    used_ai = set()
+    used_hu = set()
+    for s, i, j in candidates:
+        if i in used_ai or j in used_hu:
+            continue
+        ai_to_hu[i] = j
+        used_ai.add(i)
+        used_hu.add(j)
+        hu_used[j] = True
+
+    pairs = [(i, ai_to_hu[i]) for i in range(n_ai)]
+    for j in range(n_hu):
+        if not hu_used[j]:
+            pairs.append((None, j))
+    return pairs
 
 
 # ── HTML 渲染 ──────────────────────────────────────────────
@@ -310,21 +499,20 @@ def _render_cell(ai_cell, hu_cell, status):
 
 
 def generate_report(ai_rows, hu_rows, output):
-    hu_map = {r["key"]: r for r in hu_rows}
+    pairs = _match_rows(ai_rows, hu_rows)
 
-    ai_red_total = 0
+    ai_red_total = sum(
+        len(c["red_text"]) for r in ai_rows for c in r["cells"]
+    )
     total_del = 0
     total_add = 0
     results = []
-    matched = set()
+    n_matched = n_modified = n_deleted = n_added = 0
 
-    for ai in ai_rows:
-        ai_red = sum(len(c["red_text"]) for c in ai["cells"])
-        ai_red_total += ai_red
-
-        if ai["key"] in hu_map:
-            hm = hu_map[ai["key"]]
-            matched.add(ai["key"])
+    for ai_idx, hu_idx in pairs:
+        if ai_idx is not None and hu_idx is not None:
+            ai = ai_rows[ai_idx]
+            hm = hu_rows[hu_idx]
             d = a = 0
             for i in range(5):
                 dd, aa, _ = _diff(
@@ -334,19 +522,28 @@ def generate_report(ai_rows, hu_rows, output):
                 a += aa
             total_del += d
             total_add += a
-            results.append((ai, hm, "modified" if (d or a) else "matched"))
-        else:
-            total_del += ai_red
+            if d or a:
+                n_modified += 1
+                results.append((ai, hm, "modified"))
+            else:
+                n_matched += 1
+                results.append((ai, hm, "matched"))
+        elif ai_idx is not None:
+            ai = ai_rows[ai_idx]
+            total_del += sum(len(c["red_text"]) for c in ai["cells"])
+            n_deleted += 1
             results.append((ai, None, "deleted"))
-
-    for hm in hu_rows:
-        if hm["key"] not in matched:
+        else:
+            hm = hu_rows[hu_idx]
             total_add += sum(len(c["red_text"]) for c in hm["cells"])
+            n_added += 1
             results.append((None, hm, "added"))
 
     rate = (total_del + total_add) / ai_red_total * 100 if ai_red_total else 0
 
-    Path(output).write_text(_build_html(results, ai_red_total, total_del, total_add, rate), encoding="utf-8")
+    Path(output).write_text(
+        _build_html(results, ai_red_total, total_del, total_add, rate), encoding="utf-8"
+    )
 
     print(f"\n{'='*45}")
     print(f"  AI 测试用例质量评估报告")
@@ -355,6 +552,10 @@ def generate_report(ai_rows, hu_rows, output):
     print(f"  人工删除:         {total_del} 字符")
     print(f"  人工新增:         {total_add} 字符")
     print(f"  人工修改率:       {rate:.1f}%")
+    print(f"  ─" * 22)
+    print(f"  行匹配: 完全一致 {n_matched} / 修改 {n_modified} / 删除 {n_deleted} / 新增 {n_added}")
+    if rate > 90:
+        print(f"  ⚠ 修改率偏高，可能存在未匹配上的同义行；请人工核对。")
     print(f"{'='*45}")
     print(f"  报告已生成: {output}")
 
@@ -479,7 +680,30 @@ if __name__ == "__main__":
     p.add_argument(
         "-o", "--output", default="diff_report.html", help="输出报告 (默认: diff_report.html)"
     )
+    p.add_argument(
+        "--ai-color", default=None,
+        help="手动指定 AI 文件的高亮色（如 #ea4335）。不指定时自动探测。"
+    )
+    p.add_argument(
+        "--human-color", default=None,
+        help="手动指定人工文件用于匹配的目标色。不指定时沿用 AI 探测出的色。"
+    )
     args = p.parse_args()
-    ai_rows = parse_html_table(args.ai_file)
-    hu_rows = parse_html_table(args.human_file)
+
+    ai_rows, ai_detected, ai_target = parse_html_table(
+        args.ai_file, args.ai_color, role="AI"
+    )
+    human_target = args.human_color or ai_target
+    hu_rows, hu_detected, hu_target = parse_html_table(
+        args.human_file, human_target, role="人工"
+    )
+
+    print(f"\n[颜色探测] AI 文件:   探测={ai_detected}  匹配={ai_target}")
+    if hu_detected and ai_target:
+        same_family = ColorMatcher(ai_target)(hu_detected)
+        note = "与 AI 同色系" if same_family else "⚠ 与 AI 不同色系，可能漏匹配"
+    else:
+        note = "⚠ 未探测到高亮色"
+    print(f"[颜色探测] 人工文件: 探测={hu_detected}  匹配={hu_target}  ({note})")
+
     generate_report(ai_rows, hu_rows, args.output)
