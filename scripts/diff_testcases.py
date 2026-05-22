@@ -2,7 +2,11 @@
 """
 AI 测试用例质量评估脚本
 对比 AI 生成的 HTML 测试用例表格与人工修改后的版本，
-计算人工修改率并生成可视化 Diff 报告。
+计算 AI 用例准确率并生成可视化 Diff 报告。
+
+准确率 = (AI生成 - 人工删除) / (AI生成 + 人工新增)
+       = AI 被保留的字数 / (AI 总投入 + 人工补充)
+同时惩罚 AI 冗余（删除）和遗漏（新增）。
 
 Usage:
     python diff_testcases.py <AI生成.html> <人工修改.html> [-o 输出报告.html]
@@ -233,11 +237,21 @@ def parse_html_table(filepath, match_target=None, role="文件"):
         elif cur_mod:
             cells[0] = _make_cell([(cur_mod, False)])
 
+        # Google Sheets HTML exports include spacer/freezebar rows, and some sheets
+        # also contain section-only rows. They should not participate in testcase
+        # matching or scoring because they create fake additions/deletions.
+        if not any(cells[i]["full_text"].strip() for i in range(1, NUM_COLS)):
+            continue
+
+        name = cells[1]["full_text"].strip()
         parsed.append(
             {
                 "module": cur_mod,
-                "name": cells[1]["full_text"].strip(),
-                "key": (cur_mod, cells[1]["full_text"].strip()),
+                "name": name,
+                "norm_name": _normalize_name(name),
+                "name_variants": _name_variants(name),
+                "body_text": "\n".join(c["full_text"].strip() for c in cells[2:5]),
+                "key": (_normalize_name(cur_mod), _normalize_name(name)),
                 "cells": cells,
             }
         )
@@ -259,31 +273,96 @@ def _diff(a, b):
 # ── 行匹配 ────────────────────────────────────────────────
 
 
-# 模糊匹配阈值：名称+描述+预期 加权相似度 >= 该值才视为同一行
-FUZZY_MATCH_THRESHOLD = 0.5
+# 模糊匹配阈值：身份分数（用例名 + 整行正文加权）超过该值才视为同一条用例。
+# 略高于 0.5，避免只因通用词（视频/开关/效果）重复就错配。
+FUZZY_MATCH_THRESHOLD = 0.62
+
+
+def _normalize_for_match(text):
+    """规范化文本用于匹配：去空白、编号、常见标点差异。"""
+    if not text:
+        return ""
+    text = str(text).lower()
+    text = text.replace("\u3000", " ")
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"^\s*\d+(?:\.\d+)*\s*", "", text)
+    text = re.sub(r"[\s\r\n\t]+", "", text)
+    text = text.replace("（", "(").replace("）", ")")
+    text = text.replace("【", "").replace("】", "")
+    text = text.replace("：", ":").replace("；", ";").replace("，", ",")
+    text = text.replace("。", ".").replace("、", ",")
+    text = text.replace("—", "-").replace("–", "-").replace("－", "-")
+    text = re.sub(r"[\"'`·]", "", text)
+    return text
+
+
+def _normalize_name(name):
+    """规范化用例名/模块名。"""
+    s = _normalize_for_match(name)
+    # 去掉章节号残留，如 2.1/2.2。normalize 后小数点可能仍保留。
+    s = re.sub(r"^\d+(?:\.\d+)*", "", s)
+    return s
+
+
+def _name_variants(name):
+    """生成用例名的匹配变体，处理“分类-用例名”“模块——用例名”等人工重组。"""
+    raw = _normalize_name(name)
+    variants = {raw}
+    if not raw:
+        return [""]
+
+    parts = [p for p in re.split(r"[-:|/]+", raw) if p]
+    if len(parts) > 1:
+        variants.add(parts[-1])
+        variants.add("".join(parts[1:]))
+
+    return sorted(v for v in variants if v)
+
+
+def _similarity(a, b):
+    """文本相似度，兼顾整体相似和“短文本被长文本扩写包含”的情况。"""
+    a = _normalize_for_match(a)
+    b = _normalize_for_match(b)
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter) >= 4 and shorter in longer:
+        return 0.98
+
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    ratio = sm.ratio()
+    common = sum(block.size for block in sm.get_matching_blocks())
+    coverage = common / max(1, len(shorter))
+    # coverage 对扩写/压缩很关键，但容易被少量通用词抬高，所以轻微打折。
+    return max(ratio, coverage * 0.88)
+
+
+def _best_similarity(a_values, b_values):
+    return max(_similarity(a, b) for a in a_values for b in b_values)
 
 
 def _row_similarity(a_row, b_row):
-    """计算两行的内容相似度，加权综合 用例名/描述/预期 三列。
+    """计算两行是否为同一条用例的身份分数。
 
-    模块列不参与匹配（人工常给模块改名/加前缀），其它三列内容才是行的真正"身份"。
+    只看两个信号：用例名变体相似度 和 整行正文相似度。
+    标题强一致时，body 仅作辅助加成 —— 描述被扩写也仍判为同一条。
     """
-    def ratio(a, b):
-        if not a and not b:
-            return 1.0
-        if not a or not b:
-            return 0.0
-        return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+    name = _best_similarity(a_row["name_variants"], b_row["name_variants"])
+    body = _similarity(a_row["body_text"], b_row["body_text"])
 
-    name = ratio(a_row["cells"][1]["full_text"], b_row["cells"][1]["full_text"])
-    desc = ratio(a_row["cells"][2]["full_text"], b_row["cells"][2]["full_text"])
-    expt = ratio(a_row["cells"][3]["full_text"], b_row["cells"][3]["full_text"])
-    return name * 0.3 + desc * 0.4 + expt * 0.3
+    if name >= 0.9:
+        return 0.7 + 0.3 * body
+    return 0.5 * name + 0.5 * body
 
 
 def _match_rows(ai_rows, hu_rows):
-    """两阶段匹配：先 (模块, 用例名) 精确匹配，剩余用内容相似度贪心匹配。
+    """匹配 AI 行与人工行。
 
+    所有过阈值的候选对按分数降序贪心吃掉；冲突极少，足够好。
     返回 pairs: list of (ai_idx | None, hu_idx | None)，按 AI 行顺序，
     末尾追加未匹配上的人工新增行。
     """
@@ -291,40 +370,18 @@ def _match_rows(ai_rows, hu_rows):
     ai_to_hu = [None] * n_ai
     hu_used = [False] * n_hu
 
-    # Pass 1: 精确 key 匹配
-    hu_by_key = {}
-    for j, r in enumerate(hu_rows):
-        hu_by_key.setdefault(r["key"], []).append(j)
-    for i, ai in enumerate(ai_rows):
-        bucket = hu_by_key.get(ai["key"], [])
-        while bucket:
-            j = bucket.pop(0)
-            if not hu_used[j]:
-                ai_to_hu[i] = j
-                hu_used[j] = True
-                break
-
-    # Pass 2: 剩余行模糊匹配 — 计算所有候选对的相似度，按分数降序贪心
-    unmatched_ai = [i for i in range(n_ai) if ai_to_hu[i] is None]
-    unmatched_hu = [j for j in range(n_hu) if not hu_used[j]]
-
     candidates = []
-    for i in unmatched_ai:
-        for j in unmatched_hu:
-            s = _row_similarity(ai_rows[i], hu_rows[j])
+    for i, ai in enumerate(ai_rows):
+        for j, hu in enumerate(hu_rows):
+            s = _row_similarity(ai, hu)
             if s >= FUZZY_MATCH_THRESHOLD:
                 candidates.append((s, i, j))
     candidates.sort(reverse=True)
 
-    used_ai = set()
-    used_hu = set()
-    for s, i, j in candidates:
-        if i in used_ai or j in used_hu:
-            continue
-        ai_to_hu[i] = j
-        used_ai.add(i)
-        used_hu.add(j)
-        hu_used[j] = True
+    for _s, i, j in candidates:
+        if ai_to_hu[i] is None and not hu_used[j]:
+            ai_to_hu[i] = j
+            hu_used[j] = True
 
     pairs = [(i, ai_to_hu[i]) for i in range(n_ai)]
     for j in range(n_hu):
@@ -539,10 +596,11 @@ def generate_report(ai_rows, hu_rows, output):
             n_added += 1
             results.append((None, hm, "added"))
 
-    rate = (total_del + total_add) / ai_red_total * 100 if ai_red_total else 0
+    denom = ai_red_total + total_add
+    accuracy = (ai_red_total - total_del) / denom * 100 if denom else 0
 
     Path(output).write_text(
-        _build_html(results, ai_red_total, total_del, total_add, rate), encoding="utf-8"
+        _build_html(results, ai_red_total, total_del, total_add, accuracy), encoding="utf-8"
     )
 
     print(f"\n{'='*45}")
@@ -551,16 +609,16 @@ def generate_report(ai_rows, hu_rows, output):
     print(f"  AI 生成红色文本:  {ai_red_total} 字符")
     print(f"  人工删除:         {total_del} 字符")
     print(f"  人工新增:         {total_add} 字符")
-    print(f"  人工修改率:       {rate:.1f}%")
+    print(f"  AI 用例准确率:    {accuracy:.1f}%")
     print(f"  ─" * 22)
     print(f"  行匹配: 完全一致 {n_matched} / 修改 {n_modified} / 删除 {n_deleted} / 新增 {n_added}")
-    if rate > 90:
-        print(f"  ⚠ 修改率偏高，可能存在未匹配上的同义行；请人工核对。")
+    if accuracy < 30:
+        print(f"  [WARN] 准确率偏低，可能存在未匹配上的同义行；请人工核对。")
     print(f"{'='*45}")
     print(f"  报告已生成: {output}")
 
 
-def _build_html(results, ai_red_total, total_del, total_add, rate):
+def _build_html(results, ai_red_total, total_del, total_add, accuracy):
     hdrs = ["模块", "用例名称", "描述", "预期", "备注"]
     hdr_html = "".join(f'<th class="hdr">{h}</th>' for h in hdrs)
 
@@ -635,8 +693,8 @@ td{{border:1px solid #e0e0e0;padding:8px 10px;vertical-align:top;
 
 <div class="cards">
   <div class="card rate">
-    <div class="lbl">人工修改率</div>
-    <div class="val">{rate:.1f}%</div>
+    <div class="lbl">AI 用例准确率</div>
+    <div class="val">{accuracy:.1f}%</div>
   </div>
   <div class="card tot">
     <div class="lbl">AI 生成红色文本</div>
@@ -653,7 +711,9 @@ td{{border:1px solid #e0e0e0;padding:8px 10px;vertical-align:top;
 </div>
 
 <div class="formula">
-  人工修改率 = ( 人工删除 + 人工新增 ) / AI 生成红色文本
+  AI 用例准确率 = ( AI 生成红色文本 − 人工删除 ) / ( AI 生成红色文本 + 人工新增 )
+  <br>
+  <span style="color:#999">同时惩罚 AI 冗余（删除）和遗漏（新增）；当 AI 全被采纳且无新增时为 100%。</span>
 </div>
 
 <div class="legend">
