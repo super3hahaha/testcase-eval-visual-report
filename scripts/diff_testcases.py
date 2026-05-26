@@ -409,6 +409,18 @@ def _build_color_map(segments):
     return raw_flags[left : left + length]
 
 
+def _is_red_range(cmap, start, end):
+    """判断 cmap[start:end] 区间是否包含任意红色（用于决定差异是否计分）。"""
+    if not cmap:
+        return False
+    end = min(end, len(cmap))
+    start = max(0, start)
+    for i in range(start, end):
+        if cmap[i]:
+            return True
+    return False
+
+
 def _colorize(text, cmap, pos):
     """渲染文本，根据 color map 保留原始红/黑颜色。"""
     parts = []
@@ -431,57 +443,96 @@ def _colorize(text, cmap, pos):
     return "".join(parts)
 
 
-def _render_diff(ai_text, hu_text, cmap=None, cpos=0):
-    """行级 diff。cmap 非空时为 equal 块保留原始颜色。"""
+def _render_diff(ai_text, hu_text, ai_cmap=None, hu_cmap=None, ai_pos=0, hu_pos=0):
+    """行级 diff。ai_cmap/hu_cmap 非空时为 equal 块保留原始颜色；
+    若某段差异在 AI 与人工双方都不涉及红色文本（即不计分），
+    则只渲染人工最终文本为普通字符，不加任何 diff 样式。"""
     if ai_text == hu_text:
-        if cmap:
-            return _colorize(ai_text, cmap, cpos)
+        if ai_cmap:
+            return _colorize(ai_text, ai_cmap, ai_pos)
         return f'<span class="red-text">{_h(ai_text)}</span>' if ai_text else ""
 
     ai_lines = ai_text.split("\n")
     hu_lines = hu_text.split("\n")
 
-    line_starts = [0]
+    ai_starts = [0]
     for line in ai_lines[:-1]:
-        line_starts.append(line_starts[-1] + len(line) + 1)
+        ai_starts.append(ai_starts[-1] + len(line) + 1)
+    hu_starts = [0]
+    for line in hu_lines[:-1]:
+        hu_starts.append(hu_starts[-1] + len(line) + 1)
 
     sm = difflib.SequenceMatcher(None, ai_lines, hu_lines, autojunk=False)
     parts = []
     for op, i1, i2, j1, j2 in sm.get_opcodes():
-        pos = cpos + (line_starts[i1] if i1 < len(line_starts) else 0)
+        a_off = ai_starts[i1] if i1 < len(ai_starts) else 0
+        h_off = hu_starts[j1] if j1 < len(hu_starts) else 0
         ai_chunk = chr(10).join(ai_lines[i1:i2])
         hu_chunk = chr(10).join(hu_lines[j1:j2])
+        a_start, a_end = ai_pos + a_off, ai_pos + a_off + len(ai_chunk)
+        h_start, h_end = hu_pos + h_off, hu_pos + h_off + len(hu_chunk)
+
         if op == "equal":
-            if cmap:
-                parts.append(_colorize(ai_chunk, cmap, pos))
+            if ai_cmap:
+                parts.append(_colorize(ai_chunk, ai_cmap, a_start))
             else:
                 parts.append(f'<span class="red-text">{_h(ai_chunk)}</span>')
-        elif op == "delete":
+            continue
+
+        scoring = (
+            _is_red_range(ai_cmap, a_start, a_end)
+            or _is_red_range(hu_cmap, h_start, h_end)
+        )
+        if not scoring:
+            # 双方都是黑字 → 不计分，直接渲染人工最终文本（删除则丢弃）
+            if hu_chunk:
+                parts.append(_h(hu_chunk))
+            continue
+
+        if op == "delete":
             parts.append(f'<span class="deleted">{_h(ai_chunk)}</span>')
         elif op == "insert":
             parts.append(f'<span class="added">【{_h(hu_chunk)}】</span>')
         elif op == "replace":
-            parts.append(_render_line_replace(ai_lines[i1:i2], hu_lines[j1:j2], cmap, pos))
+            parts.append(_render_line_replace(
+                ai_lines[i1:i2], hu_lines[j1:j2], ai_cmap, hu_cmap, a_start, h_start
+            ))
     return "".join(parts)
 
 
-def _render_line_replace(old_lines, new_lines, cmap=None, cpos=0):
-    """对替换块逐行配对做字符级 diff。"""
+def _render_line_replace(old_lines, new_lines, ai_cmap=None, hu_cmap=None, ai_pos=0, hu_pos=0):
+    """对替换块逐行配对做字符级 diff。非计分黑字差异不加样式；
+    黑字行被人工删除时直接丢弃，不在报告中残留。"""
     parts = []
-    pos = cpos
+    a_pos = ai_pos
+    h_pos = hu_pos
     for i in range(max(len(old_lines), len(new_lines))):
-        if i > 0:
-            parts.append("<br>")
         ol = old_lines[i] if i < len(old_lines) else None
         nl = new_lines[i] if i < len(new_lines) else None
+
+        rendered = None
         if ol is None:
-            parts.append(f'<span class="added">【{_h(nl)}】</span>')
+            scoring = _is_red_range(hu_cmap, h_pos, h_pos + len(nl))
+            rendered = (
+                f'<span class="added">【{_h(nl)}】</span>' if scoring else _h(nl)
+            )
         elif nl is None:
-            parts.append(f'<span class="deleted">{_h(ol)}</span>')
+            scoring = _is_red_range(ai_cmap, a_pos, a_pos + len(ol))
+            if scoring:
+                rendered = f'<span class="deleted">{_h(ol)}</span>'
+            # 否则黑字被删 → 不渲染
         else:
-            parts.append(_char_diff(ol, nl, cmap, pos))
+            rendered = _char_diff(ol, nl, ai_cmap, hu_cmap, a_pos, h_pos)
+
+        if rendered:
+            if parts:
+                parts.append("<br>")
+            parts.append(rendered)
+
         if ol is not None:
-            pos += len(ol) + 1
+            a_pos += len(ol) + 1
+        if nl is not None:
+            h_pos += len(nl) + 1
     return "".join(parts)
 
 
@@ -501,8 +552,9 @@ def _clean_opcodes(ops, min_equal=3):
     return cleaned
 
 
-def _char_diff(old, new, cmap=None, cpos=0):
-    """单行字符级 diff。共同前缀 >= 3 时即使整体相似度低也做细粒度 diff。"""
+def _char_diff(old, new, ai_cmap=None, hu_cmap=None, ai_pos=0, hu_pos=0):
+    """单行字符级 diff。共同前缀 >= 3 时即使整体相似度低也做细粒度 diff。
+    非计分（双方都不涉及红色）的字符差异不加样式，仅渲染人工最终文本。"""
     sm = difflib.SequenceMatcher(None, old, new, autojunk=False)
     prefix = 0
     for a, b in zip(old, new):
@@ -511,6 +563,12 @@ def _char_diff(old, new, cmap=None, cpos=0):
         else:
             break
     if sm.ratio() < 0.3 and prefix < 3:
+        scoring = (
+            _is_red_range(ai_cmap, ai_pos, ai_pos + len(old))
+            or _is_red_range(hu_cmap, hu_pos, hu_pos + len(new))
+        )
+        if not scoring:
+            return _h(new)
         return (
             f'<span class="deleted">{_h(old)}</span>'
             f'<span class="modified">【{_h(new)}】</span>'
@@ -518,13 +576,27 @@ def _char_diff(old, new, cmap=None, cpos=0):
     ops = _clean_opcodes(sm.get_opcodes())
     parts = []
     for op, i1, i2, j1, j2 in ops:
+        a_start, a_end = ai_pos + i1, ai_pos + i2
+        h_start, h_end = hu_pos + j1, hu_pos + j2
+
         if op == "equal":
             chunk = old[i1:i2]
-            if cmap:
-                parts.append(_colorize(chunk, cmap, cpos + i1))
+            if ai_cmap:
+                parts.append(_colorize(chunk, ai_cmap, a_start))
             else:
                 parts.append(f'<span class="red-text">{_h(chunk)}</span>')
-        elif op == "delete":
+            continue
+
+        scoring = (
+            _is_red_range(ai_cmap, a_start, a_end)
+            or _is_red_range(hu_cmap, h_start, h_end)
+        )
+        if not scoring:
+            if op != "delete":
+                parts.append(_h(new[j1:j2]))
+            continue
+
+        if op == "delete":
             parts.append(f'<span class="deleted">{_h(old[i1:i2])}</span>')
         elif op == "insert":
             parts.append(f'<span class="added">【{_h(new[j1:j2])}】</span>')
@@ -534,22 +606,30 @@ def _char_diff(old, new, cmap=None, cpos=0):
     return "".join(parts)
 
 
-def _render_cell(ai_cell, hu_cell, status):
-    """渲染单个单元格的 HTML。"""
+def _render_cell(ai_cell, hu_cell, status, row_scoring=True):
+    """渲染单个单元格的 HTML。
+
+    row_scoring=False 时（整行删除/新增但全是黑字，不计分），使用更轻的样式：
+    删除仅保留删除线，新增不加 【】 和绿底。
+    """
     if status == "deleted":
-        return f'<span class="deleted">{_h(ai_cell["full_text"])}</span>'
+        cls = "deleted" if row_scoring else "deleted-plain"
+        return f'<span class="{cls}">{_h(ai_cell["full_text"])}</span>'
     if status == "added":
-        return f'<span class="added">【{_h(hu_cell["full_text"])}】</span>'
+        if row_scoring:
+            return f'<span class="added">【{_h(hu_cell["full_text"])}】</span>'
+        return _h(hu_cell["full_text"])
 
     # matched — 全文 diff，保留红/黑颜色
     ai_full = ai_cell["full_text"]
     hu_full = hu_cell["full_text"] if hu_cell else ""
-    cmap = _build_color_map(ai_cell["segments"])
+    ai_cmap = _build_color_map(ai_cell["segments"])
+    hu_cmap = _build_color_map(hu_cell["segments"]) if hu_cell else []
 
     if ai_full == hu_full:
-        return _colorize(ai_full, cmap, 0)
+        return _colorize(ai_full, ai_cmap, 0)
 
-    return _render_diff(ai_full, hu_full, cmap, 0)
+    return _render_diff(ai_full, hu_full, ai_cmap, hu_cmap, 0, 0)
 
 
 # ── 主流程 ─────────────────────────────────────────────────
@@ -565,6 +645,8 @@ def generate_report(ai_rows, hu_rows, output):
     total_add = 0
     results = []
     n_matched = n_modified = n_deleted = n_added = 0
+    # 按行保留率分桶（仅统计 AI 含红字的行；人工新增红字行单独一桶）
+    buckets = {"usable": 0, "minor": 0, "severe": 0, "deleted": 0, "added": 0}
 
     for ai_idx, hu_idx in pairs:
         if ai_idx is not None and hu_idx is not None:
@@ -579,28 +661,49 @@ def generate_report(ai_rows, hu_rows, output):
                 a += aa
             total_del += d
             total_add += a
-            if d or a:
+            ai_red = sum(len(c["red_text"]) for c in ai["cells"])
+            bucket_key = None
+            if ai_red > 0:
+                # 对称公式：与报告顶部总准确率一致，同时惩罚 AI 冗余(删除)和人工补充(新增)
+                retention = (ai_red - d) / (ai_red + a) * 100
+                if retention >= 90:
+                    bucket_key = "usable"
+                elif retention >= 70:
+                    bucket_key = "minor"
+                else:
+                    bucket_key = "severe"
+                buckets[bucket_key] += 1
+            status = "modified" if (d or a) else "matched"
+            if status == "modified":
                 n_modified += 1
-                results.append((ai, hm, "modified"))
             else:
                 n_matched += 1
-                results.append((ai, hm, "matched"))
+            results.append((ai, hm, status, bucket_key))
         elif ai_idx is not None:
             ai = ai_rows[ai_idx]
-            total_del += sum(len(c["red_text"]) for c in ai["cells"])
+            ai_red = sum(len(c["red_text"]) for c in ai["cells"])
+            total_del += ai_red
+            bucket_key = "deleted" if ai_red > 0 else None
+            if bucket_key:
+                buckets[bucket_key] += 1
             n_deleted += 1
-            results.append((ai, None, "deleted"))
+            results.append((ai, None, "deleted", bucket_key))
         else:
             hm = hu_rows[hu_idx]
-            total_add += sum(len(c["red_text"]) for c in hm["cells"])
+            hm_red = sum(len(c["red_text"]) for c in hm["cells"])
+            total_add += hm_red
+            bucket_key = "added" if hm_red > 0 else None
+            if bucket_key:
+                buckets[bucket_key] += 1
             n_added += 1
-            results.append((None, hm, "added"))
+            results.append((None, hm, "added", bucket_key))
 
     denom = ai_red_total + total_add
     accuracy = (ai_red_total - total_del) / denom * 100 if denom else 0
 
     Path(output).write_text(
-        _build_html(results, ai_red_total, total_del, total_add, accuracy), encoding="utf-8"
+        _build_html(results, ai_red_total, total_del, total_add, accuracy, buckets),
+        encoding="utf-8",
     )
 
     print(f"\n{'='*45}")
@@ -618,31 +721,69 @@ def generate_report(ai_rows, hu_rows, output):
     print(f"  报告已生成: {output}")
 
 
-def _build_html(results, ai_red_total, total_del, total_add, accuracy):
+def _build_html(results, ai_red_total, total_del, total_add, accuracy, buckets):
     hdrs = ["模块", "用例名称", "描述", "预期", "备注"]
     hdr_html = "".join(f'<th class="hdr">{h}</th>' for h in hdrs)
 
+    bucket_total = sum(buckets.values())
+    bucket_defs = [
+        ("直接可用",   "≥ 90%",        "usable",  "#0d7a0d"),
+        ("轻微修改",   "70%-90%",      "minor",   "#1a73e8"),
+        ("严重修改",   "0%-70%",       "severe",  "#f29900"),
+        ("人工删除",   "整行删除",       "deleted", "#ea4335"),
+        ("人工新增",   "绿色新行",       "added",   "#5f6368"),
+    ]
+    bucket_rows = []
+    for label, rng, key, color in bucket_defs:
+        n = buckets[key]
+        pct = (n / bucket_total * 100) if bucket_total else 0
+        clickable = ' class="bucket-row"' if n > 0 else ' class="bucket-row disabled"'
+        bucket_rows.append(
+            f'<tr{clickable} data-bucket="{key}">'
+            f'<td><span class="dot" style="background:{color}"></span>{label}</td>'
+            f'<td style="color:#888">{rng}</td>'
+            f'<td style="text-align:right;font-weight:bold">{n}</td>'
+            f'<td style="text-align:right">{pct:.1f}%</td>'
+            f'<td class="bucket-counter">{"" if n == 0 else "&nbsp;"}</td></tr>'
+        )
+    bucket_rows.append(
+        f'<tr class="total-row"><td colspan="2">合计</td>'
+        f'<td style="text-align:right;font-weight:bold">{bucket_total}</td>'
+        f'<td style="text-align:right">100%</td><td></td></tr>'
+    )
+    bucket_html = "".join(bucket_rows)
+
     rows = []
-    for ai, hm, st in results:
+    for ai, hm, st, bucket_key in results:
+        attrs = []
+        classes = []
         if st == "deleted":
-            cls = ' class="row-del"'
+            row_scoring = any(c["red_text"] for c in ai["cells"])
+            if row_scoring:
+                classes.append("row-del")
             cs = "".join(
-                f"<td>{_render_cell(ai['cells'][i], None, 'deleted')}</td>"
+                f"<td>{_render_cell(ai['cells'][i], None, 'deleted', row_scoring)}</td>"
                 for i in range(5)
             )
         elif st == "added":
-            cls = ' class="row-add"'
+            row_scoring = any(c["red_text"] for c in hm["cells"])
+            if row_scoring:
+                classes.append("row-add")
             cs = "".join(
-                f"<td>{_render_cell(None, hm['cells'][i], 'added')}</td>"
+                f"<td>{_render_cell(None, hm['cells'][i], 'added', row_scoring)}</td>"
                 for i in range(5)
             )
         else:
-            cls = ""
             cs = "".join(
                 f"<td>{_render_cell(ai['cells'][i], hm['cells'][i], 'matched')}</td>"
                 for i in range(5)
             )
-        rows.append(f"<tr{cls}>{cs}</tr>")
+        if classes:
+            attrs.append(f'class="{" ".join(classes)}"')
+        if bucket_key:
+            attrs.append(f'data-bucket="{bucket_key}"')
+        attr_str = (" " + " ".join(attrs)) if attrs else ""
+        rows.append(f"<tr{attr_str}>{cs}</tr>")
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -679,6 +820,7 @@ td{{border:1px solid #e0e0e0;padding:8px 10px;vertical-align:top;
 .red-text{{color:#ea4335}}
 .deleted{{text-decoration:line-through;color:#999;background:#fff0f0;
           padding:1px 2px;border-radius:2px}}
+.deleted-plain{{text-decoration:line-through}}
 .added{{color:#0d7a0d;font-weight:bold;background:#f0fff0;
         padding:1px 2px;border-radius:2px}}
 .modified{{color:#1155cc;font-weight:bold;background:#f0f4ff;
@@ -686,6 +828,43 @@ td{{border:1px solid #e0e0e0;padding:8px 10px;vertical-align:top;
 .row-del{{background:#fafafa}}
 .row-del td{{color:#999}}
 .row-add{{background:#f0fff0}}
+.bucket-wrap{{background:#fff;border-radius:8px;padding:14px 18px;margin-bottom:16px;
+              box-shadow:0 2px 8px rgba(0,0,0,.07)}}
+.bucket-wrap h2{{margin:0 0 10px;font-size:14px;color:#333}}
+.bucket-table{{width:auto;border-radius:0;box-shadow:none;min-width:380px}}
+.bucket-table td{{padding:6px 14px;font-size:12px;border:none;
+                  border-bottom:1px solid #f0f0f0}}
+.bucket-table tr:last-child td{{border-bottom:none}}
+.bucket-table .total-row td{{font-weight:bold;color:#333;border-top:1px solid #ddd;
+                             padding-top:8px}}
+.bucket-table tr.bucket-row{{cursor:pointer;transition:background .15s}}
+.bucket-table tr.bucket-row:hover{{background:#f0f4fa}}
+.bucket-table tr.bucket-row.disabled{{cursor:default;opacity:.5}}
+.bucket-table tr.bucket-row.disabled:hover{{background:transparent}}
+.bucket-table tr.bucket-active{{background:#eef3fc}}
+.bucket-table .bucket-counter{{font-size:11px;color:#999;text-align:right;
+                               white-space:nowrap;padding-left:8px}}
+.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;
+      margin-right:8px;vertical-align:middle}}
+tr.row-highlight{{box-shadow:inset 4px 0 0 #1a73e8;background:#fff8e1 !important}}
+tr.row-highlight td{{color:inherit !important}}
+tr.row-current{{outline:2px solid #ff6d00;outline-offset:-2px;background:#fff3e0 !important}}
+#nav-pill{{position:fixed;right:24px;bottom:32px;background:#fff;
+           border:1px solid #e0e0e0;border-radius:999px;
+           padding:6px 6px 6px 16px;display:flex;align-items:center;gap:10px;
+           box-shadow:0 6px 20px rgba(0,0,0,.18);z-index:1000;font-size:13px}}
+#nav-pill[hidden]{{display:none}}
+#nav-pill .pill-label{{font-weight:bold;color:#333}}
+#nav-pill .pill-counter{{color:#666;min-width:54px;text-align:center}}
+#nav-pill button{{border:none;background:#1a73e8;color:#fff;
+                  padding:7px 14px;border-radius:999px;cursor:pointer;
+                  font-size:12px;font-weight:500}}
+#nav-pill button:hover{{background:#1557b0}}
+#nav-pill .pill-prev{{background:#eef3fc;color:#1a73e8}}
+#nav-pill .pill-prev:hover{{background:#dde7f7}}
+#nav-pill .pill-close{{background:transparent;color:#999;padding:4px 9px;
+                       font-size:18px;line-height:1;font-weight:bold}}
+#nav-pill .pill-close:hover{{background:#f5f5f5;color:#333}}
 </style>
 </head>
 <body>
@@ -716,6 +895,17 @@ td{{border:1px solid #e0e0e0;padding:8px 10px;vertical-align:top;
   <span style="color:#999">同时惩罚 AI 冗余（删除）和遗漏（新增）；当 AI 全被采纳且无新增时为 100%。</span>
 </div>
 
+<div class="bucket-wrap">
+  <h2>用例修改率分布（按行）</h2>
+  <table class="bucket-table">
+    <tbody>{bucket_html}</tbody>
+  </table>
+  <div style="font-size:11px;color:#999;margin-top:8px">
+    准确率 = ( AI 红字 − 该行被删红字 ) ÷ ( AI 红字 + 该行人工新增红字 )；与顶部总准确率公式一致，同时惩罚删除和新增。仅统计 AI 含红字的行与人工新增的红字行。
+    <br>点击任一行可高亮下方对应用例，并显示右下角悬浮按钮，点「下一条」依次循环该桶内的用例。
+  </div>
+</div>
+
 <div class="legend">
   <span><span class="deleted">删除示例</span> 被人工删除</span>
   <span><span class="added">【新增示例】</span> 被人工新增</span>
@@ -729,6 +919,95 @@ td{{border:1px solid #e0e0e0;padding:8px 10px;vertical-align:top;
 {"".join(rows)}
 </tbody>
 </table>
+<div id="nav-pill" hidden>
+  <span class="pill-label"></span>
+  <span class="pill-counter"></span>
+  <button class="pill-prev" type="button">↑ 上一条</button>
+  <button class="pill-next" type="button">下一条 ↓</button>
+  <button class="pill-close" type="button" aria-label="关闭">×</button>
+</div>
+<script>
+(function(){{
+  let activeBucket = null;
+  let activeMatches = [];
+  let idx = -1;
+
+  const pill = document.getElementById('nav-pill');
+  const labelEl = pill.querySelector('.pill-label');
+  const counterEl = pill.querySelector('.pill-counter');
+  const prevBtn = pill.querySelector('.pill-prev');
+  const nextBtn = pill.querySelector('.pill-next');
+  const closeBtn = pill.querySelector('.pill-close');
+
+  function clearAll(){{
+    document.querySelectorAll('tr.row-highlight, tr.row-current')
+      .forEach(function(el){{ el.classList.remove('row-highlight', 'row-current'); }});
+    document.querySelectorAll('tr.bucket-active')
+      .forEach(function(el){{ el.classList.remove('bucket-active'); }});
+    document.querySelectorAll('.bucket-counter')
+      .forEach(function(el){{ el.innerHTML = '&nbsp;'; }});
+  }}
+
+  function jump(bucket, mode){{
+    // mode: 'reset' (回到第 1 条) | 'next' (循环 +1) | 'prev' (循环 -1)
+    const trigger = document.querySelector(
+      'tr.bucket-row[data-bucket="' + bucket + '"]'
+    );
+    const matches = Array.from(document.querySelectorAll(
+      'tbody tr[data-bucket="' + bucket + '"]'
+    )).filter(function(r){{ return !r.classList.contains('bucket-row'); }});
+    if (matches.length === 0) return;
+
+    clearAll();
+    if (trigger) trigger.classList.add('bucket-active');
+    matches.forEach(function(m){{ m.classList.add('row-highlight'); }});
+
+    const n = matches.length;
+    if (mode === 'reset' || activeBucket !== bucket) {{
+      idx = 0;
+    }} else if (mode === 'prev') {{
+      idx = (idx - 1 + n) % n;
+    }} else {{
+      idx = (idx + 1) % n;
+    }}
+    activeBucket = bucket;
+    activeMatches = matches;
+
+    const target = matches[idx];
+    target.classList.add('row-current');
+    target.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+
+    const text = (idx + 1) + ' / ' + matches.length;
+    const tblCounter = trigger && trigger.querySelector('.bucket-counter');
+    if (tblCounter) tblCounter.textContent = text;
+
+    const labelTd = trigger && trigger.querySelector('td:first-child');
+    labelEl.textContent = labelTd ? labelTd.textContent.trim() : bucket;
+    counterEl.textContent = text;
+    pill.hidden = false;
+  }}
+
+  document.querySelectorAll('.bucket-row').forEach(function(tr){{
+    if (tr.classList.contains('disabled')) return;
+    tr.addEventListener('click', function(){{ jump(tr.dataset.bucket, 'reset'); }});
+  }});
+
+  prevBtn.addEventListener('click', function(){{
+    if (activeBucket) jump(activeBucket, 'prev');
+  }});
+
+  nextBtn.addEventListener('click', function(){{
+    if (activeBucket) jump(activeBucket, 'next');
+  }});
+
+  closeBtn.addEventListener('click', function(){{
+    clearAll();
+    pill.hidden = true;
+    activeBucket = null;
+    idx = -1;
+  }});
+}})();
+</script>
 </body>
 </html>"""
 
