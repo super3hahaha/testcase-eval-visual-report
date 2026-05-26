@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import difflib
+import json
 import re
 import sys
 from html import escape as html_escape
@@ -632,6 +633,16 @@ def _render_cell(ai_cell, hu_cell, status, row_scoring=True):
     return _render_diff(ai_full, hu_full, ai_cmap, hu_cmap, 0, 0)
 
 
+def _render_cell_plain(cell):
+    """渲染单元格的"原始"形态：仅按 segments 的红/黑色保留，不做 diff。"""
+    if cell is None:
+        return ''
+    if not cell["full_text"]:
+        return ''
+    cmap = _build_color_map(cell["segments"])
+    return _colorize(cell["full_text"], cmap, 0)
+
+
 # ── 主流程 ─────────────────────────────────────────────────
 
 
@@ -724,6 +735,7 @@ def generate_report(ai_rows, hu_rows, output):
 def _build_html(results, ai_red_total, total_del, total_add, accuracy, buckets):
     hdrs = ["模块", "用例名称", "描述", "预期", "备注"]
     hdr_html = "".join(f'<th class="hdr">{h}</th>' for h in hdrs)
+    hdr_html += '<th class="hdr detail-col">操作</th>'
 
     bucket_total = sum(buckets.values())
     bucket_defs = [
@@ -754,7 +766,8 @@ def _build_html(results, ai_red_total, total_del, total_add, accuracy, buckets):
     bucket_html = "".join(bucket_rows)
 
     rows = []
-    for ai, hm, st, bucket_key in results:
+    details = []  # 每行原始内容（AI / 人工）的浮窗数据
+    for idx, (ai, hm, st, bucket_key) in enumerate(results):
         attrs = []
         classes = []
         if st == "deleted":
@@ -778,12 +791,33 @@ def _build_html(results, ai_red_total, total_del, total_add, accuracy, buckets):
                 f"<td>{_render_cell(ai['cells'][i], hm['cells'][i], 'matched')}</td>"
                 for i in range(5)
             )
+        cs += (
+            f'<td class="detail-col">'
+            f'<button class="detail-btn" data-idx="{idx}" type="button">详情</button>'
+            f'</td>'
+        )
         if classes:
             attrs.append(f'class="{" ".join(classes)}"')
         if bucket_key:
             attrs.append(f'data-bucket="{bucket_key}"')
         attr_str = (" " + " ".join(attrs)) if attrs else ""
         rows.append(f"<tr{attr_str}>{cs}</tr>")
+
+        # 收集弹窗数据
+        ai_html = [_render_cell_plain(c) for c in ai["cells"]] if ai else None
+        hu_html = [_render_cell_plain(c) for c in hm["cells"]] if hm else None
+        title = (ai or hm)["name"] if (ai or hm) else ""
+        module = (ai or hm)["module"] if (ai or hm) else ""
+        details.append({
+            "title": title,
+            "module": module,
+            "status": st,
+            "ai": ai_html,
+            "hu": hu_html,
+        })
+
+    # </script> 在 JSON 里不可能出现，但保险起见做个替换防注入
+    details_json = json.dumps(details, ensure_ascii=False).replace("</", "<\\/")
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -862,6 +896,67 @@ tr.row-current{{outline:2px solid #ff6d00;outline-offset:-2px;background:#fff3e0
 #nav-pill button:hover{{background:#1557b0}}
 #nav-pill .pill-prev{{background:#eef3fc;color:#1a73e8}}
 #nav-pill .pill-prev:hover{{background:#dde7f7}}
+.detail-col{{width:64px;text-align:center;white-space:nowrap}}
+.detail-btn{{border:1px solid #1a73e8;background:#fff;color:#1a73e8;
+             padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px}}
+.detail-btn:hover{{background:#1a73e8;color:#fff}}
+.row-del .detail-btn{{border-color:#bbb;color:#999}}
+.row-del .detail-btn:hover{{background:#999;color:#fff;border-color:#999}}
+#detail-modal{{position:fixed;inset:0;z-index:2000;display:flex;
+               align-items:center;justify-content:center}}
+#detail-modal[hidden]{{display:none}}
+#detail-modal .modal-backdrop{{position:absolute;inset:0;
+                               background:rgba(0,0,0,.45)}}
+#detail-modal .modal-box{{position:relative;background:#fff;border-radius:10px;
+                          width:min(1280px, 96vw);max-height:88vh;display:flex;
+                          flex-direction:column;box-shadow:0 12px 36px rgba(0,0,0,.25)}}
+#detail-modal .modal-header{{display:flex;align-items:center;
+                             justify-content:space-between;padding:14px 20px;
+                             border-bottom:1px solid #eee}}
+#detail-modal .modal-header h3{{margin:0;font-size:15px;color:#333}}
+#detail-modal .modal-header .modal-meta{{font-size:12px;color:#888;margin-top:2px}}
+#detail-modal .modal-close{{border:none;background:transparent;font-size:22px;
+                            color:#999;cursor:pointer;line-height:1;padding:4px 10px;
+                            border-radius:6px}}
+#detail-modal .modal-close:hover{{background:#f5f5f5;color:#333}}
+#detail-modal .modal-actions{{display:flex;align-items:center;gap:12px}}
+.mode-toggle{{display:inline-flex;background:#f1f3f5;border-radius:8px;
+              padding:3px;font-size:12px;gap:2px}}
+.mode-toggle button{{border:none;background:transparent;color:#5f6368;
+                     padding:5px 14px;cursor:pointer;font-size:12px;
+                     border-radius:6px;font-weight:500;transition:background .15s}}
+.mode-toggle button:not(.active):hover{{background:#e6e8eb}}
+.mode-toggle button.active{{background:#fff;color:#1a73e8;
+                            box-shadow:0 1px 2px rgba(0,0,0,.08)}}
+#detail-modal .modal-body{{padding:16px 20px;overflow:auto;flex:1;background:#fafbfc}}
+.compare-table{{width:100%;border-collapse:collapse;background:#fff;
+                table-layout:fixed;border:1px solid #e6e8eb;
+                border-radius:8px;overflow:hidden}}
+.compare-table th,.compare-table td{{border:1px solid #eef0f3;padding:10px 14px;
+                                     font-size:12px;line-height:1.7;
+                                     vertical-align:top;word-break:break-word}}
+.compare-table th{{font-weight:600}}
+.compare-table th.field-label{{background:#fafbfc;color:#5f6368;width:88px;
+                               text-align:left;font-weight:500;
+                               white-space:nowrap}}
+.compare-table th.col-head{{background:#fafbfc;color:#5f6368;text-align:center;
+                            font-weight:500;white-space:nowrap}}
+.compare-table th.corner{{background:#fafbfc;border-right-color:#e6e8eb;
+                          border-bottom-color:#e6e8eb}}
+.compare-table th.ai-head{{background:#e8f0fe;color:#1557b0;white-space:nowrap}}
+.compare-table th.hu-head{{background:#e6f4ea;color:#0d652d;white-space:nowrap}}
+/* 列模式：AI/人工 在顶部 → 居中 + 底部强调线 */
+.compare-table.col-mode th.ai-head{{text-align:center;
+                                     box-shadow:inset 0 -2px 0 #1a73e8}}
+.compare-table.col-mode th.hu-head{{text-align:center;
+                                     box-shadow:inset 0 -2px 0 #0d7a0d}}
+/* 行模式：AI/人工 在左侧 → 左对齐 + 左侧强调线，垂直居中避免大色块 */
+.compare-table.row-mode th.ai-head{{text-align:left;vertical-align:middle;
+                                     width:108px;box-shadow:inset 4px 0 0 #1a73e8}}
+.compare-table.row-mode th.hu-head{{text-align:left;vertical-align:middle;
+                                     width:108px;box-shadow:inset 4px 0 0 #0d7a0d}}
+.compare-table td.empty-cell{{color:#bbb;font-style:italic;text-align:center}}
+.detail-empty{{color:#bbb;font-style:italic;font-size:12px;padding:8px 12px}}
 #nav-pill .pill-close{{background:transparent;color:#999;padding:4px 9px;
                        font-size:18px;line-height:1;font-weight:bold}}
 #nav-pill .pill-close:hover{{background:#f5f5f5;color:#333}}
@@ -926,6 +1021,26 @@ tr.row-current{{outline:2px solid #ff6d00;outline-offset:-2px;background:#fff3e0
   <button class="pill-next" type="button">下一条 ↓</button>
   <button class="pill-close" type="button" aria-label="关闭">×</button>
 </div>
+<div id="detail-modal" hidden>
+  <div class="modal-backdrop"></div>
+  <div class="modal-box">
+    <div class="modal-header">
+      <div>
+        <h3 class="modal-title">用例对比</h3>
+        <div class="modal-meta"></div>
+      </div>
+      <div class="modal-actions">
+        <div class="mode-toggle" role="group" aria-label="布局模式">
+          <button class="active" data-mode="col" type="button">左右对比</button>
+          <button data-mode="row" type="button">行模式</button>
+        </div>
+        <button class="modal-close" type="button" aria-label="关闭">×</button>
+      </div>
+    </div>
+    <div class="modal-body"></div>
+  </div>
+</div>
+<script id="row-details" type="application/json">{details_json}</script>
 <script>
 (function(){{
   let activeBucket = null;
@@ -1005,6 +1120,118 @@ tr.row-current{{outline:2px solid #ff6d00;outline-offset:-2px;background:#fff3e0
     pill.hidden = true;
     activeBucket = null;
     idx = -1;
+  }});
+
+  // ── 详情浮窗 ────────────────────────────────────────────
+  const details = JSON.parse(document.getElementById('row-details').textContent);
+  const modal = document.getElementById('detail-modal');
+  const modalTitle = modal.querySelector('.modal-title');
+  const modalMeta = modal.querySelector('.modal-meta');
+  const modalBody = modal.querySelector('.modal-body');
+  const colNames = ['模块', '用例名称', '描述', '预期', '备注'];
+
+  let currentMode = 'col';
+  let currentDetail = null;
+  const EMPTY = '<span style="color:#bbb">—</span>';
+
+  function cellHtml(cells, i){{
+    if (!cells) return '<td class="empty-cell">（无）</td>';
+    return '<td>' + (cells[i] || EMPTY) + '</td>';
+  }}
+
+  function renderCol(d){{
+    // 列模式：字段在左侧标签列（窄），AI / 人工 各占剩余宽度的一半
+    const rows = colNames.map(function(name, i){{
+      return '<tr><th class="field-label">' + name + '</th>'
+           + cellHtml(d.ai, i)
+           + cellHtml(d.hu, i) + '</tr>';
+    }}).join('');
+    return '<table class="compare-table col-mode">'
+         + '<colgroup>'
+         + '<col style="width:96px">'
+         + '<col><col>'
+         + '</colgroup>'
+         + '<thead><tr>'
+         + '<th class="corner"></th>'
+         + '<th class="ai-head">AI 原始</th>'
+         + '<th class="hu-head">人工最终</th>'
+         + '</tr></thead>'
+         + '<tbody>' + rows + '</tbody></table>';
+  }}
+
+  function renderRow(d){{
+    // 行模式：左侧 AI/人工 标签列 + 5 字段列
+    // 模块/用例名称/备注 给固定窄宽，描述/预期 自动撑开
+    const colWidths = [null, '96px', '128px', null, null, '96px']; // 0: 标签列
+    const cols = '<colgroup>'
+               + '<col style="width:108px">'
+               + colWidths.slice(1).map(function(w){{
+                   return w ? '<col style="width:' + w + '">' : '<col>';
+                 }}).join('')
+               + '</colgroup>';
+    const heads = colNames.map(function(n){{
+      return '<th class="col-head">' + n + '</th>';
+    }}).join('');
+    function buildRow(label, cls, cells){{
+      const tds = colNames.map(function(_, i){{ return cellHtml(cells, i); }}).join('');
+      return '<tr><th class="' + cls + '">' + label + '</th>' + tds + '</tr>';
+    }}
+    return '<table class="compare-table row-mode">'
+         + cols
+         + '<thead><tr>'
+         + '<th class="corner"></th>' + heads
+         + '</tr></thead>'
+         + '<tbody>'
+         + buildRow('AI 原始', 'ai-head', d.ai)
+         + buildRow('人工最终', 'hu-head', d.hu)
+         + '</tbody></table>';
+  }}
+
+  function renderBody(d){{
+    modalBody.innerHTML = currentMode === 'row' ? renderRow(d) : renderCol(d);
+  }}
+
+  function openModal(idx){{
+    const d = details[idx];
+    if (!d) return;
+    currentDetail = d;
+    modalTitle.textContent = d.title || '用例对比';
+    const statusLabel = {{
+      matched: '完全一致', modified: '修改', deleted: '人工删除', added: '人工新增'
+    }}[d.status] || d.status;
+    modalMeta.textContent = (d.module ? d.module + ' · ' : '') + statusLabel;
+    renderBody(d);
+    modal.hidden = false;
+    document.body.style.overflow = 'hidden';
+  }}
+
+  modal.querySelectorAll('.mode-toggle button').forEach(function(btn){{
+    btn.addEventListener('click', function(){{
+      const mode = btn.dataset.mode;
+      if (mode === currentMode) return;
+      currentMode = mode;
+      modal.querySelectorAll('.mode-toggle button').forEach(function(b){{
+        b.classList.toggle('active', b.dataset.mode === mode);
+      }});
+      if (currentDetail) renderBody(currentDetail);
+    }});
+  }});
+
+  function closeModal(){{
+    modal.hidden = true;
+    document.body.style.overflow = '';
+  }}
+
+  document.querySelectorAll('.detail-btn').forEach(function(btn){{
+    btn.addEventListener('click', function(e){{
+      e.stopPropagation();
+      openModal(parseInt(btn.dataset.idx, 10));
+    }});
+  }});
+  modal.querySelector('.modal-close').addEventListener('click', closeModal);
+  modal.querySelector('.modal-backdrop').addEventListener('click', closeModal);
+  document.addEventListener('keydown', function(e){{
+    if (e.key === 'Escape' && !modal.hidden) closeModal();
   }});
 }})();
 </script>
